@@ -223,7 +223,7 @@ class PublishOp {
         }
 
         log.trace "Publish operator complete"
-        target.bind(value)
+        target.bind(indexPath ?: value)
     }
 
     /**
