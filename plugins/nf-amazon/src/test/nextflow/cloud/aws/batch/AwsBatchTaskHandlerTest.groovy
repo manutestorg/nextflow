@@ -16,8 +16,6 @@
 
 package nextflow.cloud.aws.batch
 
-import software.amazon.awssdk.services.batch.model.JobStatus
-
 import java.nio.file.Path
 import java.time.Instant
 
@@ -45,6 +43,7 @@ import nextflow.script.ProcessConfig
 import nextflow.util.CacheHelper
 import nextflow.util.MemoryUnit
 import software.amazon.awssdk.services.batch.BatchClient
+import software.amazon.awssdk.services.batch.model.AttemptDetail
 import software.amazon.awssdk.services.batch.model.ContainerDetail
 import software.amazon.awssdk.services.batch.model.DescribeJobDefinitionsRequest
 import software.amazon.awssdk.services.batch.model.DescribeJobDefinitionsResponse
@@ -54,6 +53,7 @@ import software.amazon.awssdk.services.batch.model.EvaluateOnExit
 import software.amazon.awssdk.services.batch.model.JobDefinition
 import software.amazon.awssdk.services.batch.model.JobDefinitionType
 import software.amazon.awssdk.services.batch.model.JobDetail
+import software.amazon.awssdk.services.batch.model.JobStatus
 import software.amazon.awssdk.services.batch.model.KeyValuePair
 import software.amazon.awssdk.services.batch.model.PlatformCapability
 import software.amazon.awssdk.services.batch.model.RegisterJobDefinitionResponse
@@ -908,7 +908,7 @@ class AwsBatchTaskHandlerTest extends Specification {
         when:
         def trace = handler.getTraceRecord()
         then:
-        1 * handler.isCompleted() >> false
+        2 * handler.isCompleted() >> false
         1 * handler.getMachineInfo() >> new CloudMachineInfo('x1.large', 'us-east-1b', PriceModel.spot)
         
         and:
@@ -918,6 +918,71 @@ class AwsBatchTaskHandlerTest extends Specification {
         trace.machineInfo.zone == 'us-east-1b'
         trace.machineInfo.priceModel == PriceModel.spot
     }
+
+    def 'should create the trace record when job is completed with spot reclamations' () {
+        given:
+        def exec = Mock(Executor) { getName() >> 'awsbatch' }
+        def processor = Mock(TaskProcessor)
+        processor.getExecutor() >> exec
+        processor.getName() >> 'foo'
+        processor.getConfig() >> new ProcessConfig(Mock(BaseScript))
+        def task = Mock(TaskRun)
+        task.getProcessor() >> processor
+        task.getConfig() >> GroovyMock(TaskConfig)
+        def proxy = Mock(AwsBatchProxy)
+        def handler = Spy(AwsBatchTaskHandler)
+        handler.@client = proxy
+        handler.task = task
+        handler.@jobId = 'xyz-123'
+        handler.setStatus(TaskStatus.COMPLETED)
+
+        def attempt1 = GroovyMock(AttemptDetail)
+        def attempt2 = GroovyMock(AttemptDetail)
+        attempt1.statusReason() >> 'Host EC2 (instance i-123) terminated.'
+        attempt1.container() >> null
+        attempt2.statusReason() >> 'Essential container in task exited'
+        attempt2.container() >> null
+        def job = JobDetail.builder().attempts([attempt1, attempt2]).build()
+
+        // Stub BEFORE calling the method
+        handler.isCompleted() >> true
+        handler.getMachineInfo() >> new CloudMachineInfo('x1.large', 'us-east-1b', PriceModel.spot)
+        handler.describeJob('xyz-123') >> job
+
+        when:
+        def trace = handler.getTraceRecord()
+
+        then:
+        trace.native_id == 'xyz-123'
+        trace.executorName == 'awsbatch'
+        trace.machineInfo.type == 'x1.large'
+        trace.machineInfo.zone == 'us-east-1b'
+        trace.machineInfo.priceModel == PriceModel.spot
+        trace.num_reclamations == 1
+    }
+
+    def 'should count spot reclamations from job attempts'() {
+        given:
+        def attempts = attemptReasons?.collect { reason ->
+            GroovyMock(AttemptDetail) {
+                statusReason() >> reason
+                container() >> null
+            }
+        }
+        def job = JobDetail.builder().attempts(attempts).build()
+
+        expect:
+        AwsBatchTaskHandler.countSpotReclamations(job) == expectedCount
+
+        where:
+        description                                    | attemptReasons                                                                          | expectedCount
+        'no attempts (null)'                           | null                                                                                    | 0
+        'empty attempts list'                          | []                                                                                      | 0
+        'single spot reclamation'                      | ['Host EC2 (instance i-123) terminated.', 'Essential container in task exited']         | 1
+        'multiple spot reclamations'                   | ['Host EC2 (instance i-123) terminated.', 'Host EC2 (instance i-456) terminated.']      | 2
+        'no spot interruptions'                        | ['Essential container in task exited', null]                                            | 0
+    }
+
 
     def 'should render submit command' () {
         given:
